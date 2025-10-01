@@ -96,7 +96,18 @@ def measure(m, n, cta, warmup=10, iters=50):
     }
 
 if __name__ == "__main__":
-    dist.init_process_group(backend="nccl")
+    import os as _os
+    if "INIT_METHOD" in _os.environ:
+        _rank = int(_os.environ["RANK"])
+        _world = int(_os.environ["WORLD_SIZE"])
+        dist.init_process_group(
+            backend="nccl",
+            init_method=_os.environ["INIT_METHOD"],  # e.g., file:///shared/rdzv/pg
+            rank=_rank,
+            world_size=_world,
+        )
+    else:
+        dist.init_process_group(backend="nccl")
 
     # Use LOCAL_RANK for correct GPU binding on multi-GPU nodes
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
