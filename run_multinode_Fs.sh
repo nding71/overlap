@@ -7,16 +7,15 @@ set -euo pipefail
 # It auto-assigns node_rank by writing to a shared folder.
 ############################################
 
-########## CONFIG — edit these 3 lines to match your setup ##########
+########## EDIT THESE 3 LINES (once) ##########
 NNODES=2                                  # total number of nodes in your job
-WORKDIR="/shared/project/overlap"         # folder that ALL nodes can see
-RDZV_DIR="/shared/rdzv"                   # shared, writable folder for rendezvous
-########################################################################
+WORKDIR="$(cd "$(dirname "$0")" && pwd)"  # folder with overlap_allgather.py (visible on all nodes)
+RDZV_DIR="${WORKDIR}/.rdzv_shared"        # shared, writable folder for rendezvous
+###############################################
 
-# Script & Python (adjust if needed)
 SCRIPT="overlap_allgather.py"
 PYTHON_BIN="python"
-ACTIVATE_CMD=""     # e.g.: ACTIVATE_CMD='source ~/miniconda3/bin/activate pt'
+ACTIVATE_CMD=""     # e.g.: 'source ~/miniconda3/bin/activate pt'
 LOGDIR="${WORKDIR}/logs"
 
 # Autodetect GPUs per node (fallback to 8)
@@ -24,7 +23,7 @@ detect_nproc() {
   if command -v nvidia-smi >/dev/null 2>&1; then
     nvidia-smi -L | wc -l
   elif command -v rocminfo >/dev/null 2>&1; then
-    # crude count of GPUs on ROCm
+    # crude GPU count for ROCm systems
     rocminfo | grep -c "Compute Unit" || echo 8
   else
     echo 8
@@ -32,9 +31,9 @@ detect_nproc() {
 }
 NPROC_PER_NODE="$(detect_nproc)"
 
-# Niceties
+# Optional NCCL hygiene
 export NCCL_ASYNC_ERROR_HANDLING=1
-# export NCCL_DEBUG=INFO   # uncomment for debugging
+# export NCCL_DEBUG=INFO   # uncomment while debugging
 
 mkdir -p "$LOGDIR" "$RDZV_DIR" "$RDZV_DIR/nodes"
 cd "$WORKDIR"
@@ -48,7 +47,7 @@ this_id="$hostname_short-$$-$(date +%s%N)"
 
 exec 9>"$LOCK_FILE"
 flock 9
-# write once
+# ensure unique line for this node instance
 if ! grep -qxF "$this_id" "$NODE_FILE" 2>/dev/null; then
   echo "$this_id" >> "$NODE_FILE"
 fi
