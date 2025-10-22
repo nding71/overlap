@@ -5,34 +5,30 @@ from itertools import product
 import torch
 import torch.distributed as dist
 
-def measure(m, n, cta, warmup=10, iters=50):
+def measure(m, k, n, cta, warmup=50, iters=1000):
     """
-    m: matmul matrix dimension (square: m×m)
-    n: comm tensor dimension (square: n×n)
-    cta: number of NCCL CTAs to request
-    returns dict with matmul_time_ms, comm_time_ms, overlap_time_ms
+    GEMM: A(m×k) @ B(k×n) -> C(m×n)
+    AllGather communicates m×k
     """
     dev = torch.device("cuda")
 
-    # force NCCL CTA settings
+    # These usually need to be set before init_process_group to take effect.
     os.environ["NCCL_MIN_NCHANNELS"] = str(cta)
     os.environ["NCCL_MAX_NCHANNELS"] = str(cta)
-    os.environ["NCCL_MIN_CTAS"]     = str(cta)
-    os.environ["NCCL_MAX_CTAS"]     = str(cta)
+    os.environ["NCCL_MIN_CTAS"]      = str(cta)
+    os.environ["NCCL_MAX_CTAS"]      = str(cta)
 
-    # random matmul inputs
-    A = torch.randn(m, m, device=dev, dtype=torch.bfloat16)
-    B = torch.randn(m, m, device=dev, dtype=torch.bfloat16)
+    # --- random matmul inputs ---
+    A = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    B = torch.randn(k, n, device=dev, dtype=torch.bfloat16)
 
-    # ----- all_gather buffers -----
+    # --- all_gather buffers (communicate m × k) ---
     world_sz = dist.get_world_size()
-    # each rank contributes an (n x n) tensor
-    x_local = torch.randn(n, n, device=dev, dtype=torch.bfloat16)
+    x_local  = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
 
-    # prefer the fused into-tensor API if available
     use_into = hasattr(dist, "all_gather_into_tensor")
     if use_into:
-        gathered = torch.empty(world_sz, n, n, device=dev, dtype=torch.bfloat16)
+        gathered = torch.empty(world_sz, m, k, device=dev, dtype=torch.bfloat16)
         def do_allgather():
             dist.all_gather_into_tensor(gathered, x_local)
     else:
@@ -64,7 +60,7 @@ def measure(m, n, cta, warmup=10, iters=50):
     # 1) compute only
     t_mat = time_kernel(lambda: torch.matmul(A, B), stream_comp)
 
-    # 2) comm only (all_gather)
+    # 2) comm only (all_gather of m×k)
     t_comm = time_kernel(do_allgather, stream_comm)
 
     # 3) overlap both
@@ -88,8 +84,9 @@ def measure(m, n, cta, warmup=10, iters=50):
         "comm_ms":     t_comm,
         "overlap_ms":  t_overlap,
         "CTA":         cta,
-        "matmul_size": m,
-        "comm_size":   n,
+        "M":           m,
+        "K":           k,
+        "N":           n,
         "world_size":  world_sz,
         "rank":        dist.get_rank(),
         "gather_api":  "into_tensor" if use_into else "list",
@@ -102,18 +99,22 @@ if __name__ == "__main__":
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
 
-    cta_list    = [16, 32, 64]
-    sizes_mat   = [2**i for i in range(10, 16)]
-    sizes_comm  = [2**i for i in range(10, 16)]
+    cta_list = [16, 32, 64]
+
+    # m from 1 to 524,288 doubling each step
+    m_list = [2**i for i in range(0, 19)]  # 2^18 = 262144, 2^19 = 524288
+    k_list = [128, 256, 512]               # adjust as you like
+    n_list = [1024, 2048, 4096]            # adjust as you like
 
     results = []
-    for cta, m_sz, c_sz in product(cta_list, sizes_mat, sizes_comm):
-        res = measure(m_sz, c_sz, cta)
+    for cta, m_sz, k_sz, n_sz in product(cta_list, m_list, k_list, n_list):
+        res = measure(m_sz, k_sz, n_sz, cta)
         if dist.get_rank() == 0:
             results.append(res)
+            # Report as M, N, K
             print(
-                f"CTA={cta:2d} Mat={m_sz:6d}×{m_sz:6d}  "
-                f"Comm={c_sz:6d}×{c_sz:6d} →  "
+                f"CTA={cta:2d}  "
+                f"M={m_sz:6d}  N={n_sz:6d}  K={k_sz:6d}  "
                 f"Mat {res['matmul_ms']:.2f}ms  "
                 f"Comm {res['comm_ms']:.2f}ms  "
                 f"Ovrlp {res['overlap_ms']:.2f}ms  "
